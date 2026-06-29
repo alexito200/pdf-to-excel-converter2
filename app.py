@@ -246,7 +246,7 @@ def build_workbook(rows):
         cell = ws.cell(row=1, column=c, value=header)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
         cell.border = BORDER
 
     # Data rows
@@ -262,15 +262,21 @@ def build_workbook(rows):
 
     ws.freeze_panes = "A2"
 
-    # Column widths
+    # Filter dropdown buttons across the whole table.
+    last_row = len(rows) + 1
+    last_col = get_column_letter(len(ALL_COLUMNS))
+    ws.auto_filter.ref = f"A1:{last_col}{last_row}"
+
+    # Auto-fit each column to the widest of its header (plus room for the
+    # filter-dropdown button) and its cell contents.
     for c_idx, header in enumerate(ALL_COLUMNS, start=1):
         col = get_column_letter(c_idx)
-        max_len = len(str(header))
-        for row in rows:
-            v = row.get(header, "")
-            if v not in (None, ""):
-                max_len = max(max_len, len(str(v)))
-        ws.column_dimensions[col].width = min(max(max_len + 2, 7), 26)
+        content_len = max(
+            [len(str(row.get(header, ""))) for row in rows
+             if row.get(header, "") not in (None, "")] + [0]
+        )
+        width = max(content_len, len(str(header)) + 3) + 1
+        ws.column_dimensions[col].width = min(width, 60)
 
     buf = io.BytesIO()
     wb.save(buf)
