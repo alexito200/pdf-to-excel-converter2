@@ -1,266 +1,326 @@
 """
-PDF-To-Excel Converter (Streamlit) — general purpose.
+Size Breakdown Check -> Excel converter
+=======================================
+A Streamlit app that converts Haddad Apparel Group "SIZE BREAKDOWN CHECK"
+(program EDIPAKLE) PDF reports into a clean Excel workbook.
 
-Concept: extract text from any PDF, reconstruct columns from the geometry of
-the words on the page, and write a formatted Excel file. Two engines:
+The report is a fixed-width monospace layout, so every field sits at a stable
+horizontal position. We parse by x-coordinate (via pdfplumber) rather than by
+splitting on whitespace, which keeps things robust against blank cells and
+variable-length size lists.
 
-  • Layout engine (default): rebuilds columns from word x/y positions. Works on
-    borderless / fixed-width reports as well as ordinary tables.
-  • Ruled-table engine: uses pdfplumber's table finder, best for PDFs with
-    visible cell borders.
+SIZE RATIOS layout (per the requested format):
+  - Each record occupies two rows.
+  - Row 1 holds all the fields plus  "ORDER: <values>"      in SIZE RATIOS.
+  - Row 2 (fields blank) holds        "PRODUCED: <values>"  in SIZE RATIOS.
+  - Multiple values are joined with dashes, e.g. 20-39-38-19.
+  - Records are separated by an optional blank row.
 
-Conversion is best-effort, not guaranteed pixel-perfect. Controls in the
-sidebar let you tune it per file.
-
-Run:  streamlit run app.py
+Run with:  streamlit run app.py
+Requires:  streamlit, pdfplumber, openpyxl, pandas
 """
 
 import io
 import re
-import traceback
-
-import pandas as pd
 import pdfplumber
+import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="PDF-To-Excel Converter", page_icon="📄", layout="centered")
-st.title("PDF-To-Excel Converter")
-st.write(
-    "Drop a PDF below (or click **Browse files**). The app rebuilds the data "
-    "into columns and gives you a formatted Excel file to download."
-)
+# ---------------------------------------------------------------------------
+# Report geometry (template constants for this specific report type).
+# x-coordinates are in PDF points. Numbers are right-aligned inside the size
+# slots, so we key off each token's right edge (x1).
+# ---------------------------------------------------------------------------
+FIELD_BOUNDS = [
+    ("ACC #",       30, 58),
+    ("STORE",       58, 84),
+    ("PO#",         84, 148),
+    ("RECEIVED",   148, 184),
+    ("IBM",        184, 218),   # IBM number    ─┐ combined into "IBM/PCK"
+    ("PCK",        218, 233),   # -N pick suffix ┘
+    ("LIN#",       233, 247),
+    ("SEASON/YR",  247, 272),
+    ("DIV",        272, 281),
+    ("STYLE",      281, 310),
+    ("COLOR",      310, 326),
+    ("LABEL",      326, 340),
+]
 
-# ----------------------------------------------------------------------
-# Geometry helpers
-# ----------------------------------------------------------------------
-def cluster_rows(words, y_tol=3.0):
-    """Group words into visual rows by their vertical position."""
-    rows, cur, cur_top = [], [], None
-    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
-        if cur_top is None or abs(w["top"] - cur_top) <= y_tol:
-            cur.append(w)
-            cur_top = w["top"] if cur_top is None else cur_top
+SIZE_X0_MIN = 365      # left edge of the size-ratio region (after the Order/Produced label)
+SIZE_X1_MAX = 665      # right edge (excludes the static "SizeRatio_Difference" label)
+FIRST_SLOT_X1 = 391.8  # right edge of size slot #1
+SLOT_PITCH = 25.2      # horizontal distance between adjacent size slots
+
+BASE_COLUMNS = ["ACC #", "STORE", "PO#", "RECEIVED", "IBM/PCK", "LIN#",
+                "SEASON/YR", "DIV", "STYLE", "COLOR", "LABEL"]
+SIZE_COLUMN = "SIZE RATIOS"
+ALL_COLUMNS = BASE_COLUMNS + [SIZE_COLUMN]
+
+# Columns kept as text so Excel doesn't strip leading zeros / reinterpret values.
+TEXT_COLUMNS = {"ACC #", "STORE", "PO#", "RECEIVED", "IBM/PCK", "SEASON/YR",
+                "DIV", "STYLE", "COLOR", "LABEL", "SIZE RATIOS"}
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+def _to_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return v
+
+
+def _fmt_date(s):
+    """Expand a 2-digit year to 4 digits: 6/24/26 -> 6/24/2026."""
+    s = (s or "").strip()
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{2})$", s)
+    if m:
+        mo, d, y = m.groups()
+        return f"{int(mo)}/{int(d)}/20{y}"
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+def _cluster_lines(words, tol=3):
+    """Group words that share (roughly) the same vertical position into lines."""
+    lines = []
+    for w in sorted(words, key=lambda x: x["top"]):
+        if lines and abs(w["top"] - lines[-1][0]) <= tol:
+            lines[-1][1].append(w)
         else:
-            rows.append(sorted(cur, key=lambda w: w["x0"]))
-            cur, cur_top = [w], w["top"]
-    if cur:
-        rows.append(sorted(cur, key=lambda w: w["x0"]))
+            lines.append([w["top"], [w]])
+    return [sorted(ws, key=lambda x: x["x0"]) for _, ws in lines]
+
+
+def _field_of(x0):
+    for name, lo, hi in FIELD_BOUNDS:
+        if lo <= x0 < hi:
+            return name
+    return None
+
+
+def _make_slot_mapper(all_x1):
+    """
+    Map a token's right edge to a 0-based size slot, used only to order the
+    numbers left-to-right. Uses the fixed template grid; if a page's
+    coordinates don't line up (different margin/scale), anchors on the
+    left-most observed value instead and flags it.
+    """
+    def fixed(x1):
+        return round((x1 - FIRST_SLOT_X1) / SLOT_PITCH)
+
+    drift_ok = True
+    if all_x1:
+        resid = max(abs(x1 - (FIRST_SLOT_X1 + SLOT_PITCH * fixed(x1))) for x1 in all_x1)
+        drift_ok = resid <= 3.0
+
+    if drift_ok:
+        return fixed, True
+
+    anchor = min(all_x1) if all_x1 else FIRST_SLOT_X1
+    return (lambda x1: round((x1 - anchor) / SLOT_PITCH)), False
+
+
+def parse_pdf(file_obj):
+    """Return (records, grid_aligned). Each record is a dict of base fields plus
+    '_order' / '_prod' mappings {slot_index: value_string}."""
+    records = []
+    all_x1 = []
+
+    with pdfplumber.open(file_obj) as pdf:
+        pages_lines = []
+        for page in pdf.pages:
+            lines = _cluster_lines(page.extract_words())
+            pages_lines.append(lines)
+            for ln in lines:
+                texts = [w["text"] for w in ln]
+                # Only sample size positions from real data lines (Order/Produced),
+                # never from the header's "----- SIZE RATIOS -----" banner.
+                if "Order" not in texts and "Produced" not in texts:
+                    continue
+                for w in ln:
+                    if (w["text"] not in ("Order", "Produced")
+                            and SIZE_X0_MIN <= w["x0"] and w["x1"] < SIZE_X1_MAX):
+                        all_x1.append(w["x1"])
+
+    slot_for, grid_aligned = _make_slot_mapper(all_x1)
+
+    for lines in pages_lines:
+        for i, ln in enumerate(lines):
+            texts = [w["text"] for w in ln]
+            if "Order" not in texts:          # only "Order" lines start a record
+                continue
+
+            rec = {n: "" for n, _, _ in FIELD_BOUNDS}
+            order_slots = {}
+            for w in ln:
+                if w["text"] == "Order":
+                    continue
+                if SIZE_X0_MIN <= w["x0"] and w["x1"] < SIZE_X1_MAX:
+                    order_slots[slot_for(w["x1"])] = w["text"]
+                else:
+                    f = _field_of(w["x0"])
+                    if f:
+                        rec[f] = (rec[f] + " " + w["text"]).strip()
+
+            # The matching "Produced" line is the next line below (before any
+            # following "Order" line) that contains the word Produced.
+            prod_slots = {}
+            for ln2 in lines[i + 1:]:
+                t2 = [w["text"] for w in ln2]
+                if "Order" in t2:
+                    break
+                if "Produced" in t2:
+                    for w in ln2:
+                        if (w["text"] != "Produced"
+                                and SIZE_X0_MIN <= w["x0"] and w["x1"] < SIZE_X1_MAX):
+                            prod_slots[slot_for(w["x1"])] = w["text"]
+                    break
+
+            ibm = rec.pop("IBM")
+            pck = rec.pop("PCK")
+            rec["IBM/PCK"] = " // ".join(p for p in (ibm, pck) if p)
+            rec["RECEIVED"] = _fmt_date(rec["RECEIVED"])
+            rec["_order"] = order_slots
+            rec["_prod"] = prod_slots
+            records.append(rec)
+
+    return records, grid_aligned
+
+
+# ---------------------------------------------------------------------------
+# Shaping records into the two-row ORDER / PRODUCED layout
+# ---------------------------------------------------------------------------
+def _join_ratios(slots):
+    return "-".join(slots[k] for k in sorted(slots))
+
+
+def build_rows(records, separator=True):
+    """
+    Expand records into output rows. Each record -> an ORDER row (with all the
+    fields) and a PRODUCED row (fields blank), optionally followed by a blank
+    separator row. The 'kind' key marks each row for styling and is not output.
+    """
+    rows = []
+    for idx, r in enumerate(records):
+        order_row = {c: r[c] for c in BASE_COLUMNS}
+        order_row["LIN#"] = _to_int(r["LIN#"])
+        order_row[SIZE_COLUMN] = f"ORDER: {_join_ratios(r['_order'])}"
+        order_row["kind"] = "order"
+        rows.append(order_row)
+
+        prod_row = {c: "" for c in BASE_COLUMNS}
+        prod_row[SIZE_COLUMN] = f"PRODUCED: {_join_ratios(r['_prod'])}"
+        prod_row["kind"] = "produced"
+        rows.append(prod_row)
+
+        if separator and idx < len(records) - 1:
+            blank = {c: "" for c in ALL_COLUMNS}
+            blank["kind"] = "blank"
+            rows.append(blank)
     return rows
 
 
-def detect_columns(words, min_gap=10.0):
-    """Return column x-ranges by merging word spans separated by < min_gap."""
-    spans = sorted((w["x0"], w["x1"]) for w in words)
-    merged = []
-    for a, b in spans:
-        if merged and a <= merged[-1][1] + min_gap:
-            merged[-1][1] = max(merged[-1][1], b)
-        else:
-            merged.append([a, b])
-    return [tuple(m) for m in merged]
+# ---------------------------------------------------------------------------
+# Excel output
+# ---------------------------------------------------------------------------
+HEADER_FILL = PatternFill("solid", fgColor="1F3864")
+HEADER_FONT = Font(color="FFFFFF", bold=True, size=10)
+THIN = Side(style="thin", color="BFBFBF")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 
-def assign_row(row, cols):
-    """Place each word of a row into its column; join multiples with a space."""
-    cells = [[] for _ in cols]
-    centers = [(a + b) / 2 for a, b in cols]
-    for w in row:
-        c = (w["x0"] + w["x1"]) / 2
-        idx = next((i for i, (a, b) in enumerate(cols) if a - 0.5 <= c <= b + 0.5), None)
-        if idx is None:
-            idx = min(range(len(cols)), key=lambda i: abs(centers[i] - c))
-        cells[idx].append(w["text"])
-    return [" ".join(c).strip() for c in cells]
+def build_workbook(rows):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Size Breakdown"
+
+    # Header row
+    for c, header in enumerate(ALL_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=c, value=header)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = BORDER
+
+    # Data rows
+    for r_idx, row in enumerate(rows, start=2):
+        for c_idx, header in enumerate(ALL_COLUMNS, start=1):
+            cell = ws.cell(row=r_idx, column=c_idx, value=row.get(header, ""))
+            cell.border = BORDER
+            if header in TEXT_COLUMNS:
+                cell.number_format = "@"
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+            else:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.freeze_panes = "A2"
+
+    # Column widths
+    for c_idx, header in enumerate(ALL_COLUMNS, start=1):
+        col = get_column_letter(c_idx)
+        max_len = len(str(header))
+        for row in rows:
+            v = row.get(header, "")
+            if v not in (None, ""):
+                max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[col].width = min(max(max_len + 2, 7), 26)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 
-# ----------------------------------------------------------------------
-# Layout engine: reconstruct columns from word positions, combine pages
-# ----------------------------------------------------------------------
-def extract_layout(pdf, min_gap, combine, use_header):
-    page_rows = []          # list of (page_num, [row_words, ...])
-    all_words = []
-    for page_num, page in enumerate(pdf.pages, start=1):
-        words = page.extract_words(use_text_flow=False, keep_blank_chars=False) or []
-        page_rows.append((page_num, cluster_rows(words)))
-        all_words.extend(words)
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Size Breakdown -> Excel", page_icon="📐", layout="wide")
+st.title("Size Breakdown Check → Excel")
+st.caption("Converts Haddad Apparel Group SIZE BREAKDOWN CHECK (EDIPAKLE) PDFs into a clean spreadsheet.")
 
-    if not all_words:
-        return {"Extracted Text": pd.DataFrame({"Note": ["No selectable text found in this PDF."]})}
-
-    if combine:
-        cols = detect_columns(all_words, min_gap)
-        n = len(cols)
-        records = []
-        for page_num, rows in page_rows:
-            for row in rows:
-                cells = assign_row(row, cols)
-                if any(c for c in cells):
-                    records.append([page_num] + cells)
-        df = pd.DataFrame(records, columns=["Page"] + [f"Column {i+1}" for i in range(n)])
-        df = _apply_header(df, use_header, page_aware=True)
-        return {"Data": df}
-
-    # One sheet per page, each with its own column model.
-    sheets = {}
-    for page_num, rows in page_rows:
-        words = [w for r in rows for w in r]
-        if not words:
-            continue
-        cols = detect_columns(words, min_gap)
-        n = len(cols)
-        records = [assign_row(r, cols) for r in rows]
-        records = [r for r in records if any(c for c in r)]
-        df = pd.DataFrame(records, columns=[f"Column {i+1}" for i in range(n)])
-        df = _apply_header(df, use_header, page_aware=False)
-        sheets[f"Page {page_num}"] = df
-    return sheets or {"Extracted Text": pd.DataFrame({"Note": ["Nothing extracted."]})}
-
-
-def _apply_header(df, use_header, page_aware):
-    """Optionally promote the first row to column names and drop repeated headers."""
-    if not use_header or df.empty:
-        return df
-    data_cols = df.columns[1:] if page_aware else df.columns
-    first = df.iloc[0]
-    names = []
-    seen = {}
-    for i, col in enumerate(df.columns):
-        if page_aware and i == 0:
-            names.append("Page")
-            continue
-        val = str(first[col]).strip() or f"Column {i+1}"
-        if val in seen:
-            seen[val] += 1
-            val = f"{val} ({seen[val]})"
-        else:
-            seen[val] = 0
-        names.append(val)
-    body = df.iloc[1:].copy()
-    body.columns = names
-    # Drop rows identical to the header (repeated page headers).
-    header_vals = [n for n in names if n != "Page"]
-    mask = body[[c for c in body.columns if c != "Page"]].astype(str).apply(
-        lambda r: list(r) != header_vals, axis=1)
-    return body[mask].reset_index(drop=True)
-
-
-# ----------------------------------------------------------------------
-# Ruled-table engine
-# ----------------------------------------------------------------------
-def extract_tables(pdf, use_header):
-    sheets, count = {}, 0
-    for page_num, page in enumerate(pdf.pages, start=1):
-        for t_idx, table in enumerate(page.extract_tables() or [], start=1):
-            if not table:
-                continue
-            width = max(len(r) for r in table)
-            norm = [list(r) + [""] * (width - len(r)) for r in table]
-            df = pd.DataFrame(norm)
-            if use_header and len(df) > 1:
-                df.columns = [str(c) if c not in (None, "") else f"Column {i+1}"
-                              for i, c in enumerate(df.iloc[0])]
-                df = df.iloc[1:].reset_index(drop=True)
-            sheets[f"P{page_num} T{t_idx}"[:31]] = df
-            count += 1
-    if count == 0:
-        return None
-    return sheets
-
-
-# ----------------------------------------------------------------------
-# Excel writing + best-effort styling
-# ----------------------------------------------------------------------
-def _style_sheet(ws, n_cols):
-    try:
-        from openpyxl.styles import Alignment, Font, PatternFill
-        from openpyxl.utils import get_column_letter
-
-        for cell in ws[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="1F4E78")
-            cell.alignment = Alignment(vertical="center")
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = f"A1:{get_column_letter(max(n_cols, 1))}{ws.max_row}"
-        for col_cells in ws.columns:
-            letter = col_cells[0].column_letter
-            longest = max((len(str(c.value)) for c in col_cells if c.value is not None),
-                          default=8)
-            ws.column_dimensions[letter].width = min(max(longest + 2, 8), 50)
-    except Exception:
-        pass
-
-
-def build_workbook(sheets):
-    output = io.BytesIO()
-    items = list(sheets.items())[:100]  # Excel/practicality cap
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for name, df in items:
-            safe = (name or "Sheet")[:31]
-            (df if len(df.columns) else pd.DataFrame({"Note": ["(empty)"]})).to_excel(
-                writer, sheet_name=safe, index=False)
-        wb = writer.book
-        for name, df in items:
-            ws = wb[(name or "Sheet")[:31]]
-            _style_sheet(ws, max(len(df.columns), 1))
-    output.seek(0)
-    return output.getvalue()
-
-
-def convert(file_bytes, engine, min_gap, combine, use_header):
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        if engine == "Ruled tables":
-            sheets = extract_tables(pdf, use_header)
-            if sheets is None:
-                sheets = extract_layout(pdf, min_gap, combine, use_header)
-        else:
-            sheets = extract_layout(pdf, min_gap, combine, use_header)
-        total_rows = sum(len(df) for df in sheets.values())
-        return build_workbook(sheets), len(sheets), total_rows
-
-
-# ----------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------
-with st.sidebar:
-    st.header("Options")
-    engine = st.radio(
-        "Extraction engine",
-        ["Layout (any PDF)", "Ruled tables"],
-        help="Layout rebuilds columns from text positions. Ruled tables uses "
-             "visible cell borders (falls back to Layout if none are found).",
-    )
-    min_gap = st.slider(
-        "Column gap sensitivity", 3, 40, 10,
-        help="Smaller = split into more columns. Larger = merge into fewer. "
-             "Tune this if columns look wrong.",
-    )
-    combine = st.checkbox("Combine all pages into one sheet", value=True)
-    use_header = st.checkbox("Use first row as column titles", value=True)
-
-uploaded_file = st.file_uploader(
-    "Drag and drop a PDF here", type=["pdf"], accept_multiple_files=False
+uploaded = st.file_uploader(
+    "Upload one or more Size Breakdown PDFs",
+    type=["pdf"],
+    accept_multiple_files=True,
 )
 
-if uploaded_file is not None:
-    excel_bytes = None
-    with st.spinner("Converting…"):
-        try:
-            excel_bytes, n_sheets, n_rows = convert(
-                uploaded_file.read(), engine, float(min_gap), combine, use_header
-            )
-            message = f"Done — {n_rows} rows across {n_sheets} sheet(s)."
-        except Exception:
-            st.error("Conversion failed. Open the details and share them so this can be fixed.")
-            with st.expander("Error details"):
-                st.code(traceback.format_exc())
+separator = st.checkbox("Add a blank row between records", value=True)
 
-    if excel_bytes:
-        st.success(message)
-        st.caption("If the columns look off, adjust **Column gap sensitivity** in the sidebar and re-upload.")
-        out_name = uploaded_file.name.rsplit(".", 1)[0] + ".xlsx"
+if uploaded:
+    all_records = []
+    grid_warned = False
+    for f in uploaded:
+        try:
+            recs, aligned = parse_pdf(f)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not read **{f.name}**: {e}")
+            continue
+        if not recs:
+            st.warning(f"No Size Breakdown records found in **{f.name}** — is it the right report type?")
+        if not aligned and not grid_warned:
+            st.info("This PDF's size columns didn't match the expected grid exactly, so the "
+                    "left-to-right order was inferred from the data. Spot-check the SIZE RATIOS.")
+            grid_warned = True
+        all_records.extend(recs)
+
+    if all_records:
+        rows = build_rows(all_records, separator=separator)
+        df = pd.DataFrame(rows, columns=ALL_COLUMNS).fillna("")
+        st.success(f"Parsed {len(all_records)} record(s) from {len(uploaded)} file(s).")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
         st.download_button(
-            label="⬇️  Download Excel file",
-            data=excel_bytes,
-            file_name=out_name,
+            "⬇️ Download Excel",
+            data=build_workbook(rows),
+            file_name="size_breakdown.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+else:
+    st.info("Upload a PDF to get started.")
